@@ -1,0 +1,156 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// SQLite has no native enum support in Prisma, so the following fields are
+// plain strings whose allowed values are enforced in code — see src/lib/constants.ts
+//   FailedCharge.status       -> ChargeStatus  (NEW | RETRY_SCHEDULED | WAITING_FOR_PAYMENT | RECOVERED | ESCALATED | STOPPED)
+//   FailedCharge.recoveryMode -> RecoveryMode  (SIMULATED | VERIFIED) — set only once status becomes RECOVERED
+//   RecoveryAction.type       -> ActionType    (AUTO_RETRY | SEND_REMINDER | OFFER_ALT_METHOD | ESCALATE_HUMAN | STOP)
+//   RecoveryAction.decidedBy  -> DecidedBy     (RULE | LLM | HUMAN)
+//   AuditLog.actorType        -> ActorType     (SYSTEM | RULE_ENGINE | LLM | HUMAN | RAZORPAY_WEBHOOK)
+//   WebhookEvent.status       -> "RECEIVED" | "PROCESSED" — see the idempotency note below
+
+model Customer {
+  id            String         @id @default(cuid())
+  name          String
+  email         String
+  phone         String
+  createdAt     DateTime       @default(now())
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id                     String         @id @default(cuid())
+  customerId             String
+  customer               Customer       @relation(fields: [customerId], references: [id])
+  planName               String
+  amountPaise            Int
+  intervalDays           Int
+  status                 String         @default("active")
+  razorpaySubscriptionId String?
+  createdAt              DateTime       @default(now())
+  failedCharges          FailedCharge[]
+}
+
+model FailedCharge {
+  id               String           @id @default(cuid())
+  subscriptionId   String
+  subscription     Subscription     @relation(fields: [subscriptionId], references: [id])
+  amountPaise      Int
+  declineCode      String
+  declineReasonRaw String
+  category         String
+  attemptNumber    Int              @default(1)
+  status           String           @default("NEW")
+  occurredAt       DateTime         @default(now())
+  nextRetryAt      DateTime?
+  recoveredAt      DateTime?
+  stoppedReason    String?
+
+  // Only ever set once status = RECOVERED. VERIFIED means a real Razorpay
+  // payment_link.paid webhook confirmed the money moved; SIMULATED means the
+  // outcome came from the documented probability model (see simulate-outcome.ts),
+  // which is only ever used when no real Razorpay payment link exists.
+  // These are never conflated in the UI or in analytics totals.
+  recoveryMode String?
+
+  // The payment link currently outstanding for this charge, if any — set when
+  // a SEND_REMINDER/OFFER_ALT_METHOD action fires, cleared once resolved.
+  // pendingPaymentLinkIsReal distinguishes a genuine Razorpay-created link
+  // (RAZORPAY_KEY_ID/SECRET configured, API call succeeded) from a mocked one
+  // (no keys, or the API call failed) — this flag is what stops the
+  // simulator from ever resolving a real outstanding link. Only the
+  // payment_link.paid webhook may resolve a real one.
+  pendingPaymentLinkId     String?
+  pendingPaymentLinkIsReal Boolean @default(false)
+  razorpayPaymentId        String?
+
+  // Dedup key for the payment.failed webhook handler — the Razorpay payment
+  // id that produced this FailedCharge, when it came from a real webhook
+  // rather than the synthetic-data generator. Prevents a retried webhook
+  // delivery from creating a second FailedCharge for the same failure.
+  razorpaySourceFailedPaymentId String?
+
+  actions   RecoveryAction[]
+  auditLogs AuditLog[]
+
+  @@index([razorpaySourceFailedPaymentId])
+}
+
+model RecoveryAction {
+  id               String       @id @default(cuid())
+  failedChargeId   String
+  failedCharge     FailedCharge @relation(fields: [failedChargeId], references: [id])
+  type             String
+  decidedBy        String
+  reasoning        String
+  requiresApproval Boolean      @default(false)
+  approvedAt       DateTime?
+  executedAt       DateTime?
+  outcome          String?
+  createdAt        DateTime     @default(now())
+
+  // Populated when the type/reasoning came from the LLM recommendation step
+  // rather than the deterministic fallback (see recommendRecoveryAction in
+  // src/lib/llm.ts). The policy engine always validates the recommendation
+  // against the category's allowed-action set before using it.
+  aiRecommended Boolean @default(false)
+  confidence    Float?
+
+  // Set for SEND_REMINDER / OFFER_ALT_METHOD actions that created a real
+  // Razorpay payment link; razorpayPaymentId is filled in only once the
+  // payment_link.paid webhook confirms payment.
+  razorpayPaymentLinkId String?
+  razorpayPaymentId     String?
+  verifiedAt            DateTime?
+
+  @@index([razorpayPaymentLinkId])
+}
+
+model AuditLog {
+  id             String       @id @default(cuid())
+  failedChargeId String
+  failedCharge   FailedCharge @relation(fields: [failedChargeId], references: [id])
+  actorType      String
+  action         String
+  detail         String
+  createdAt      DateTime     @default(now())
+}
+
+// Single-row virtual clock. Retry backoff and the 7-day compliance window
+// operate in days; a demo can't sit and wait for real days to pass, so the
+// dashboard can fast-forward this instead of faking timestamps directly on
+// each record. Real webhook-driven events are unaffected — they use actual
+// wall-clock time regardless of where the virtual clock currently sits.
+model SimClock {
+  id          String   @id @default("singleton")
+  currentTime DateTime @default(now())
+}
+
+// Idempotency ledger for the Razorpay webhook. `id` is the incoming event's
+// dedupe key (x-razorpay-event-id header when present, otherwise a hash of
+// the raw body).
+//
+// Two-phase so a crash mid-handling is safely retryable rather than being
+// silently swallowed:
+//   1. On first sight of an event id, a row is inserted with status="RECEIVED"
+//      *before* the handler runs.
+//   2. Only once the handler completes successfully is it flipped to
+//      status="PROCESSED".
+// A row still sitting at "RECEIVED" means the previous attempt crashed or
+// errored partway through — the same delivery (same event id, from Razorpay's
+// own retry) is allowed to reprocess it. Only "PROCESSED" short-circuits as
+// a true duplicate.
+model WebhookEvent {
+  id         String   @id
+  event      String
+  status     String   @default("RECEIVED")
+  receivedAt DateTime @default(now())
+  processedAt DateTime?
+}
