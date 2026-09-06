@@ -47,4 +47,5 @@ next-env.d.ts
 
 # claude
 
+.launch.json
 .claude
